@@ -1,0 +1,714 @@
+import { useState, useMemo, useCallback } from "react";
+
+// --- Rate/Lookup Tables (simulating the Google Sheets data) ---
+const MODULE_RATES = {
+  "Adani 545W": { wp: 545, rate: 14.5 },
+  "Trina 550W": { wp: 550, rate: 15.2 },
+  "Jinko 540W": { wp: 540, rate: 14.8 },
+  "Waaree 545W": { wp: 545, rate: 14.0 },
+  "Canadian Solar 550W": { wp: 550, rate: 15.5 },
+  "LONGi 555W": { wp: 555, rate: 15.0 },
+};
+
+const INVERTER_RATES = {
+  "Sungrow": { rate: 3.2, optimiser: false },
+  "Huawei": { rate: 3.8, optimiser: true },
+  "ABB/FIMER": { rate: 3.5, optimiser: false },
+  "Growatt": { rate: 2.9, optimiser: false },
+  "SolarEdge": { rate: 4.2, optimiser: true },
+  "Enphase": { rate: 4.5, optimiser: true },
+};
+
+const STRUCTURE_COSTS = {
+  "Elevated": { 1: 6500, 2: 7200, 3: 8000 },
+  "Flush Mount": { 1: 4500, 2: 5200, 3: 6000 },
+  "Ground Mount": { 1: 5500, 2: 6200, 3: 7000 },
+  "RCC": { 1: 8000, 2: 9000, 3: 10000 },
+};
+
+const MARGIN_PROFILES = [
+  { minCap: 0, maxCap: 10, margin: 0.18 },
+  { minCap: 10, maxCap: 50, margin: 0.15 },
+  { minCap: 50, maxCap: 100, margin: 0.12 },
+  { minCap: 100, maxCap: 9999, margin: 0.10 },
+];
+
+const PAYMENT_MODES = {
+  "100% Advance": { discount: 0.02 },
+  "50-50": { discount: 0.01 },
+  "30-40-30": { discount: 0 },
+  "EMI": { discount: -0.02 },
+};
+
+const LOCATIONS = ["Mumbai", "Pune", "Delhi", "Bangalore", "Chennai", "Ahmedabad", "Kolkata", "Hyderabad", "Jaipur", "Lucknow"];
+const DISCOMS = ["MSEDCL", "Tata Power", "BSES Rajdhani", "BSES Yamuna", "BESCOM", "TANGEDCO", "UGVCL", "CESC"];
+const MMS_CLASSES = ["Class A", "Class B", "Class C"];
+const MMS_HEIGHTS = ["< 10m", "10-15m", "15-20m", "> 20m"];
+const INSTALLATION_TYPES = ["Elevated", "Flush Mount", "Ground Mount", "RCC"];
+const FLOOR_OPTIONS = ["1", "2", "3", "3+"];
+
+// --- BOM Calculation Engine ---
+function calculateBOM(inputs) {
+  const moduleInfo = MODULE_RATES[inputs.moduleMake] || { wp: 545, rate: 14.5 };
+  const inverterInfo = INVERTER_RATES[inputs.inverterMake] || { rate: 3.2, optimiser: false };
+  const numModules = Math.round((inputs.projectCapacity * 1000) / moduleInfo.wp);
+  const actualCapacity = (numModules * moduleInfo.wp) / 1000;
+  const floors = parseInt(inputs.numberOfFloors) || 1;
+  const structureCostPerKw = (STRUCTURE_COSTS[inputs.installationType] || {})[Math.min(floors, 3)] || 5500;
+  const marginProfile = MARGIN_PROFILES.find(m => actualCapacity >= m.minCap && actualCapacity < m.maxCap) || MARGIN_PROFILES[0];
+
+  const moduleCost = numModules * moduleInfo.wp * moduleInfo.rate / 1000;
+  const inverterCost = actualCapacity * inverterInfo.rate * 1000;
+  const structureCost = actualCapacity * structureCostPerKw;
+  const acCableCost = actualCapacity * 1200;
+  const dcCableCost = actualCapacity * 800;
+  const acdbCost = actualCapacity > 50 ? 45000 : actualCapacity > 10 ? 25000 : 15000;
+  const dcdbCost = actualCapacity > 50 ? 35000 : actualCapacity > 10 ? 18000 : 10000;
+  const earthingCost = actualCapacity * 450;
+  const meterCost = 8500;
+  const netMeterCost = 3500;
+  const icCost = actualCapacity > 50 ? 65000 : actualCapacity > 10 ? 35000 : 15000;
+  const amcCost = actualCapacity * 800;
+  const labourCost = actualCapacity * 2500;
+  const transportCost = (moduleCost + inverterCost + structureCost) * 0.005;
+  const miscCost = actualCapacity * 500;
+
+  const totalBOMCost = moduleCost + inverterCost + structureCost + acCableCost + dcCableCost + acdbCost + dcdbCost + earthingCost + meterCost + netMeterCost + icCost + amcCost + labourCost + transportCost + miscCost;
+  const margin = totalBOMCost * marginProfile.margin;
+  const subtotal = totalBOMCost + margin;
+  const paymentMode = PAYMENT_MODES[inputs.paymentMode] || { discount: 0 };
+  const paymentAdjustment = subtotal * paymentMode.discount;
+  const finalPrice = subtotal - paymentAdjustment;
+  const pricePerKw = finalPrice / actualCapacity;
+
+  return {
+    numModules, actualCapacity, moduleWp: moduleInfo.wp,
+    components: [
+      { name: "Solar Modules", qty: numModules, unit: "Nos", rate: moduleInfo.wp * moduleInfo.rate / 1000, cost: moduleCost, category: "Module" },
+      { name: "Inverter", qty: actualCapacity, unit: "kW", rate: inverterInfo.rate * 1000, cost: inverterCost, category: "Inverter" },
+      { name: "Structure", qty: actualCapacity, unit: "kW", rate: structureCostPerKw, cost: structureCost, category: "Structure" },
+      { name: "AC Cables", qty: actualCapacity, unit: "kW", rate: 1200, cost: acCableCost, category: "Electrical" },
+      { name: "DC Cables", qty: actualCapacity, unit: "kW", rate: 800, cost: dcCableCost, category: "Electrical" },
+      { name: "ACDB", qty: 1, unit: "Set", rate: acdbCost, cost: acdbCost, category: "Electrical" },
+      { name: "DCDB", qty: 1, unit: "Set", rate: dcdbCost, cost: dcdbCost, category: "Electrical" },
+      { name: "Earthing", qty: actualCapacity, unit: "kW", rate: 450, cost: earthingCost, category: "Electrical" },
+      { name: "Meter", qty: 1, unit: "Nos", rate: meterCost, cost: meterCost, category: "Metering" },
+      { name: "Net Meter", qty: 1, unit: "Nos", rate: netMeterCost, cost: netMeterCost, category: "Metering" },
+      { name: "IC (Interconnection)", qty: 1, unit: "Set", rate: icCost, cost: icCost, category: "Metering" },
+      { name: "AMC (1 Year)", qty: actualCapacity, unit: "kW", rate: 800, cost: amcCost, category: "Service" },
+      { name: "Labour & Installation", qty: actualCapacity, unit: "kW", rate: 2500, cost: labourCost, category: "Service" },
+      { name: "Transport", qty: 1, unit: "LS", rate: transportCost, cost: transportCost, category: "Logistics" },
+      { name: "Miscellaneous", qty: actualCapacity, unit: "kW", rate: 500, cost: miscCost, category: "Other" },
+    ],
+    totalBOMCost, margin, marginPercent: marginProfile.margin, subtotal, paymentAdjustment, finalPrice, pricePerKw,
+  };
+}
+
+// --- Formatting ---
+const fmt = (n) => "₹" + (n || 0).toLocaleString("en-IN", { maximumFractionDigits: 0 });
+const fmtDec = (n) => (n || 0).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+
+// --- Styles ---
+const colors = {
+  bg: "#f7f8fa", card: "#ffffff", primary: "#1a56db", primaryLight: "#e8eefb",
+  accent: "#f59e0b", accentLight: "#fef3c7", success: "#059669", successLight: "#d1fae5",
+  danger: "#dc2626", dangerLight: "#fee2e2", text: "#1e293b", textMid: "#475569",
+  textLight: "#94a3b8", border: "#e2e8f0", divider: "#f1f5f9",
+};
+
+const baseBtn = {
+  border: "none", borderRadius: 8, cursor: "pointer", fontWeight: 600,
+  fontSize: 14, padding: "10px 20px", transition: "all 0.15s ease",
+};
+
+// --- Components ---
+function NavItem({ icon, label, active, onClick, badge }) {
+  return (
+    <button onClick={onClick} style={{
+      display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "10px 16px",
+      background: active ? colors.primaryLight : "transparent", border: "none", borderRadius: 8,
+      cursor: "pointer", color: active ? colors.primary : colors.textMid, fontWeight: active ? 600 : 400,
+      fontSize: 14, textAlign: "left", transition: "all 0.15s",
+    }}>
+      <span style={{ fontSize: 18, width: 24, textAlign: "center" }}>{icon}</span>
+      <span style={{ flex: 1 }}>{label}</span>
+      {badge && <span style={{
+        background: colors.danger, color: "#fff", borderRadius: 10,
+        fontSize: 11, fontWeight: 700, padding: "2px 7px", minWidth: 20, textAlign: "center",
+      }}>{badge}</span>}
+    </button>
+  );
+}
+
+function StatCard({ label, value, sub, color }) {
+  return (
+    <div style={{
+      background: colors.card, borderRadius: 12, padding: "20px 24px",
+      border: `1px solid ${colors.border}`, flex: "1 1 200px", minWidth: 180,
+    }}>
+      <div style={{ fontSize: 13, color: colors.textLight, marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 28, fontWeight: 700, color: color || colors.text, lineHeight: 1.1 }}>{value}</div>
+      {sub && <div style={{ fontSize: 12, color: colors.textMid, marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function SectionHeader({ title, subtitle }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: colors.text }}>{title}</h3>
+      {subtitle && <p style={{ margin: "4px 0 0", fontSize: 13, color: colors.textLight }}>{subtitle}</p>}
+    </div>
+  );
+}
+
+function FormField({ label, children, hint }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <label style={{ display: "block", fontSize: 13, fontWeight: 600, color: colors.textMid, marginBottom: 5 }}>{label}</label>
+      {children}
+      {hint && <div style={{ fontSize: 11, color: colors.textLight, marginTop: 3 }}>{hint}</div>}
+    </div>
+  );
+}
+
+function Input({ type = "text", value, onChange, placeholder, disabled, style: s }) {
+  return (
+    <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+      disabled={disabled}
+      style={{
+        width: "100%", padding: "9px 12px", border: `1px solid ${colors.border}`, borderRadius: 8,
+        fontSize: 14, color: colors.text, background: disabled ? colors.divider : "#fff",
+        outline: "none", boxSizing: "border-box", ...s,
+      }}
+    />
+  );
+}
+
+function Select({ value, onChange, options, placeholder }) {
+  return (
+    <select value={value} onChange={e => onChange(e.target.value)} style={{
+      width: "100%", padding: "9px 12px", border: `1px solid ${colors.border}`, borderRadius: 8,
+      fontSize: 14, color: colors.text, background: "#fff", outline: "none", boxSizing: "border-box",
+      appearance: "auto",
+    }}>
+      <option value="">{placeholder || "Select..."}</option>
+      {options.map(o => <option key={typeof o === "string" ? o : o.value} value={typeof o === "string" ? o : o.value}>
+        {typeof o === "string" ? o : o.label}
+      </option>)}
+    </select>
+  );
+}
+
+function Toggle({ value, onChange, label }) {
+  return (
+    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+      <div onClick={() => onChange(!value)} style={{
+        width: 40, height: 22, borderRadius: 11, background: value ? colors.primary : colors.border,
+        position: "relative", transition: "background 0.2s", cursor: "pointer",
+      }}>
+        <div style={{
+          width: 18, height: 18, borderRadius: "50%", background: "#fff",
+          position: "absolute", top: 2, left: value ? 20 : 2, transition: "left 0.2s",
+          boxShadow: "0 1px 3px rgba(0,0,0,0.15)",
+        }} />
+      </div>
+      <span style={{ fontSize: 14, color: colors.text }}>{label}</span>
+    </label>
+  );
+}
+
+function Badge({ status }) {
+  const map = {
+    "Draft": { bg: colors.divider, color: colors.textMid },
+    "Pending": { bg: colors.accentLight, color: "#92400e" },
+    "Approved": { bg: colors.successLight, color: "#065f46" },
+    "Rejected": { bg: colors.dangerLight, color: "#991b1b" },
+  };
+  const s = map[status] || map.Draft;
+  return <span style={{ display: "inline-block", padding: "3px 10px", borderRadius: 6, fontSize: 12, fontWeight: 600, background: s.bg, color: s.color }}>{status}</span>;
+}
+
+// --- Main App ---
+export default function App() {
+  const [page, setPage] = useState("dashboard");
+  const [quotations, setQuotations] = useState([
+    { id: "Q-001", leadName: "Rajesh Sharma", projectCapacity: 25, moduleMake: "Adani 545W", inverterMake: "Sungrow", installationType: "Elevated", numberOfFloors: "2", mmsClass: "Class A", mmsHeight: "10-15m", location: "Mumbai", discom: "MSEDCL", serviceLift: false, paymentMode: "30-40-30", status: "Approved", createdAt: "2026-09-01" },
+    { id: "Q-002", leadName: "Priya Patel", projectCapacity: 50, moduleMake: "Trina 550W", inverterMake: "Huawei", installationType: "Ground Mount", numberOfFloors: "1", mmsClass: "Class B", mmsHeight: "< 10m", location: "Pune", discom: "MSEDCL", serviceLift: false, paymentMode: "50-50", status: "Pending", createdAt: "2026-09-05" },
+    { id: "Q-003", leadName: "Amit Kumar", projectCapacity: 100, moduleMake: "Jinko 540W", inverterMake: "ABB/FIMER", installationType: "RCC", numberOfFloors: "3", mmsClass: "Class A", mmsHeight: "15-20m", location: "Delhi", discom: "BSES Rajdhani", serviceLift: true, paymentMode: "100% Advance", status: "Draft", createdAt: "2026-09-10" },
+  ]);
+  const [selectedId, setSelectedId] = useState(null);
+  const [formData, setFormData] = useState(null);
+
+  const selectedQuotation = quotations.find(q => q.id === selectedId);
+  const bomData = useMemo(() => {
+    const data = formData || selectedQuotation;
+    return data ? calculateBOM(data) : null;
+  }, [formData, selectedQuotation]);
+
+  const totalPipeline = quotations.reduce((sum, q) => {
+    const b = calculateBOM(q);
+    return sum + b.finalPrice;
+  }, 0);
+
+  const pendingCount = quotations.filter(q => q.status === "Pending").length;
+  const approvedCount = quotations.filter(q => q.status === "Approved").length;
+  const totalCapacity = quotations.reduce((s, q) => s + (calculateBOM(q).actualCapacity), 0);
+
+  const handleNew = () => {
+    const newId = `Q-${String(quotations.length + 1).padStart(3, "0")}`;
+    setFormData({
+      id: newId, leadName: "", projectCapacity: 10, moduleMake: "", inverterMake: "",
+      installationType: "Elevated", numberOfFloors: "1", mmsClass: "Class A", mmsHeight: "< 10m",
+      location: "", discom: "", serviceLift: false, paymentMode: "30-40-30", status: "Draft",
+      createdAt: new Date().toISOString().slice(0, 10),
+    });
+    setSelectedId(null);
+    setPage("form");
+  };
+
+  const handleEdit = (q) => {
+    setFormData({ ...q });
+    setSelectedId(q.id);
+    setPage("form");
+  };
+
+  const handleSave = () => {
+    if (!formData.leadName || !formData.moduleMake || !formData.inverterMake) return;
+    setQuotations(prev => {
+      const idx = prev.findIndex(q => q.id === formData.id);
+      if (idx >= 0) { const next = [...prev]; next[idx] = formData; return next; }
+      return [...prev, formData];
+    });
+    setSelectedId(formData.id);
+    setFormData(null);
+    setPage("detail");
+  };
+
+  const handleApprove = (id) => setQuotations(prev => prev.map(q => q.id === id ? { ...q, status: "Approved" } : q));
+  const handleReject = (id) => setQuotations(prev => prev.map(q => q.id === id ? { ...q, status: "Rejected" } : q));
+
+  const updateForm = useCallback((key, val) => setFormData(prev => ({ ...prev, [key]: val })), []);
+
+  // --- Render ---
+  return (
+    <div style={{ display: "flex", height: "100vh", fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, sans-serif", background: colors.bg, color: colors.text }}>
+      {/* Sidebar */}
+      <div style={{ width: 240, background: colors.card, borderRight: `1px solid ${colors.border}`, padding: "20px 12px", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 8px", marginBottom: 28 }}>
+          <div style={{ width: 32, height: 32, borderRadius: 8, background: `linear-gradient(135deg, ${colors.primary}, ${colors.accent})`, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 800, fontSize: 14 }}>SQ</div>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 700, lineHeight: 1.2 }}>B2B Quotation</div>
+            <div style={{ fontSize: 11, color: colors.textLight }}>SolarSquare</div>
+          </div>
+        </div>
+        <NavItem icon="📊" label="Dashboard" active={page === "dashboard"} onClick={() => { setPage("dashboard"); setFormData(null); }} />
+        <NavItem icon="📝" label="Quotations" active={page === "list"} onClick={() => { setPage("list"); setFormData(null); }} badge={pendingCount || null} />
+        <NavItem icon="➕" label="New Quotation" active={page === "form" && !selectedId} onClick={handleNew} />
+        <NavItem icon="✅" label="Approvals" active={page === "approvals"} onClick={() => { setPage("approvals"); setFormData(null); }} badge={pendingCount || null} />
+        <div style={{ borderTop: `1px solid ${colors.border}`, margin: "12px 0" }} />
+        <NavItem icon="📦" label="BOM Breakup" active={page === "bom"} onClick={() => { if (selectedQuotation) setPage("bom"); }} />
+        <NavItem icon="💰" label="Pricing" active={page === "detail"} onClick={() => { if (selectedQuotation) setPage("detail"); }} />
+        <div style={{ flex: 1 }} />
+        <div style={{ padding: "12px", background: colors.divider, borderRadius: 8, fontSize: 12, color: colors.textMid }}>
+          Logged in as<br /><strong style={{ color: colors.text }}>sanket.mhatre@solarsquare.in</strong>
+        </div>
+      </div>
+
+      {/* Main content */}
+      <div style={{ flex: 1, overflow: "auto", padding: 28 }}>
+        {page === "dashboard" && (
+          <div>
+            <h2 style={{ margin: "0 0 24px", fontSize: 22, fontWeight: 700 }}>Dashboard</h2>
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 28 }}>
+              <StatCard label="Total Pipeline Value" value={fmt(totalPipeline)} sub={`${quotations.length} quotations`} color={colors.primary} />
+              <StatCard label="Total Capacity" value={`${fmtDec(totalCapacity)} kW`} sub="Across all quotations" color={colors.success} />
+              <StatCard label="Pending Approvals" value={pendingCount} sub="Awaiting review" color={colors.accent} />
+              <StatCard label="Approved" value={approvedCount} sub={`${quotations.length > 0 ? Math.round(approvedCount / quotations.length * 100) : 0}% conversion`} color={colors.success} />
+            </div>
+            <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: 24 }}>
+              <SectionHeader title="Recent Quotations" />
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+                <thead>
+                  <tr style={{ borderBottom: `2px solid ${colors.border}` }}>
+                    {["ID", "Lead Name", "Capacity", "Status", "Value", "Date"].map(h => (
+                      <th key={h} style={{ textAlign: "left", padding: "10px 12px", color: colors.textLight, fontWeight: 600, fontSize: 12 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {quotations.map(q => {
+                    const b = calculateBOM(q);
+                    return (
+                      <tr key={q.id} onClick={() => { setSelectedId(q.id); setPage("detail"); }} style={{ borderBottom: `1px solid ${colors.divider}`, cursor: "pointer" }}
+                        onMouseEnter={e => e.currentTarget.style.background = colors.divider}
+                        onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                        <td style={{ padding: "12px", fontWeight: 600, color: colors.primary }}>{q.id}</td>
+                        <td style={{ padding: "12px" }}>{q.leadName}</td>
+                        <td style={{ padding: "12px" }}>{fmtDec(b.actualCapacity)} kW</td>
+                        <td style={{ padding: "12px" }}><Badge status={q.status} /></td>
+                        <td style={{ padding: "12px", fontWeight: 600 }}>{fmt(b.finalPrice)}</td>
+                        <td style={{ padding: "12px", color: colors.textLight }}>{q.createdAt}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {page === "list" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+              <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>Quotations</h2>
+              <button onClick={handleNew} style={{ ...baseBtn, background: colors.primary, color: "#fff" }}>+ New Quotation</button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {quotations.map(q => {
+                const b = calculateBOM(q);
+                return (
+                  <div key={q.id} onClick={() => { setSelectedId(q.id); setPage("detail"); }} style={{
+                    background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`,
+                    padding: "18px 24px", cursor: "pointer", display: "flex", alignItems: "center", gap: 20,
+                    transition: "box-shadow 0.15s",
+                  }}
+                    onMouseEnter={e => e.currentTarget.style.boxShadow = "0 2px 8px rgba(0,0,0,0.08)"}
+                    onMouseLeave={e => e.currentTarget.style.boxShadow = "none"}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+                        <span style={{ fontWeight: 700, color: colors.primary }}>{q.id}</span>
+                        <Badge status={q.status} />
+                      </div>
+                      <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 2 }}>{q.leadName}</div>
+                      <div style={{ fontSize: 13, color: colors.textLight }}>
+                        {q.moduleMake} · {q.inverterMake} · {q.location} · {fmtDec(b.actualCapacity)} kW
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 20, fontWeight: 700, color: colors.text }}>{fmt(b.finalPrice)}</div>
+                      <div style={{ fontSize: 12, color: colors.textLight }}>{fmt(b.pricePerKw)}/kW</div>
+                    </div>
+                    <button onClick={(e) => { e.stopPropagation(); handleEdit(q); }} style={{ ...baseBtn, background: colors.divider, color: colors.textMid, padding: "8px 14px", fontSize: 13 }}>Edit</button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {page === "form" && formData && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+              <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>{selectedId ? `Edit ${formData.id}` : "New Quotation"}</h2>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={() => { setFormData(null); setPage(selectedId ? "detail" : "list"); }} style={{ ...baseBtn, background: colors.divider, color: colors.textMid }}>Cancel</button>
+                <button onClick={handleSave} style={{ ...baseBtn, background: colors.primary, color: "#fff" }}>Save Quotation</button>
+              </div>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+              {/* Left: Form */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: 24 }}>
+                  <SectionHeader title="Basic Details" subtitle="Lead and project information" />
+                  <FormField label="Lead Name">
+                    <Input value={formData.leadName} onChange={v => updateForm("leadName", v)} placeholder="Enter lead name" />
+                  </FormField>
+                  <FormField label="Project Capacity (kW)" hint="Enter the exact desired capacity">
+                    <Input type="number" value={formData.projectCapacity} onChange={v => updateForm("projectCapacity", parseFloat(v) || 0)} />
+                  </FormField>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <FormField label="Module Make">
+                      <Select value={formData.moduleMake} onChange={v => updateForm("moduleMake", v)} options={Object.keys(MODULE_RATES)} placeholder="Select module" />
+                    </FormField>
+                    <FormField label="Module Wp">
+                      <Input value={formData.moduleMake ? MODULE_RATES[formData.moduleMake]?.wp || "" : ""} disabled placeholder="Auto from module" />
+                    </FormField>
+                  </div>
+                  <FormField label="Inverter Make">
+                    <Select value={formData.inverterMake} onChange={v => updateForm("inverterMake", v)} options={Object.keys(INVERTER_RATES)} placeholder="Select inverter" />
+                  </FormField>
+                  {formData.inverterMake && INVERTER_RATES[formData.inverterMake]?.optimiser && (
+                    <div style={{ padding: "10px 14px", background: colors.accentLight, borderRadius: 8, fontSize: 13, color: "#92400e" }}>
+                      ⚡ This inverter includes an optimiser
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: 24 }}>
+                  <SectionHeader title="Project Specific Inputs" subtitle="Site and installation details" />
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <FormField label="Installation Type">
+                      <Select value={formData.installationType} onChange={v => updateForm("installationType", v)} options={INSTALLATION_TYPES} />
+                    </FormField>
+                    <FormField label="Number of Floors">
+                      <Select value={formData.numberOfFloors} onChange={v => updateForm("numberOfFloors", v)} options={FLOOR_OPTIONS} />
+                    </FormField>
+                    <FormField label="MMS Class">
+                      <Select value={formData.mmsClass} onChange={v => updateForm("mmsClass", v)} options={MMS_CLASSES} />
+                    </FormField>
+                    <FormField label="MMS Height">
+                      <Select value={formData.mmsHeight} onChange={v => updateForm("mmsHeight", v)} options={MMS_HEIGHTS} />
+                    </FormField>
+                    <FormField label="Location">
+                      <Select value={formData.location} onChange={v => updateForm("location", v)} options={LOCATIONS} />
+                    </FormField>
+                    <FormField label="Discom">
+                      <Select value={formData.discom} onChange={v => updateForm("discom", v)} options={DISCOMS} />
+                    </FormField>
+                  </div>
+                  <Toggle value={formData.serviceLift} onChange={v => updateForm("serviceLift", v)} label="Service Lift Available" />
+                </div>
+
+                <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: 24 }}>
+                  <SectionHeader title="Payment" />
+                  <FormField label="Payment Mode">
+                    <Select value={formData.paymentMode} onChange={v => updateForm("paymentMode", v)} options={Object.keys(PAYMENT_MODES)} />
+                  </FormField>
+                </div>
+              </div>
+
+              {/* Right: Live BOM Preview */}
+              <div>
+                {bomData && (
+                  <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: 24, position: "sticky", top: 20 }}>
+                    <SectionHeader title="Live Pricing Preview" subtitle={`${bomData.numModules} modules · ${fmtDec(bomData.actualCapacity)} kW actual`} />
+                    <div style={{ display: "flex", gap: 12, marginBottom: 20 }}>
+                      <div style={{ flex: 1, background: colors.primaryLight, borderRadius: 8, padding: "14px 16px" }}>
+                        <div style={{ fontSize: 11, color: colors.primary, fontWeight: 600 }}>Final Price</div>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: colors.primary }}>{fmt(bomData.finalPrice)}</div>
+                      </div>
+                      <div style={{ flex: 1, background: colors.divider, borderRadius: 8, padding: "14px 16px" }}>
+                        <div style={{ fontSize: 11, color: colors.textMid, fontWeight: 600 }}>Per kW</div>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: colors.text }}>{fmt(bomData.pricePerKw)}</div>
+                      </div>
+                    </div>
+
+                    {/* Cost Breakdown Bar */}
+                    <div style={{ marginBottom: 16 }}>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: colors.textMid, marginBottom: 6 }}>Cost Breakdown</div>
+                      <div style={{ display: "flex", borderRadius: 6, overflow: "hidden", height: 24 }}>
+                        {[
+                          { cat: "Module", color: "#3b82f6" }, { cat: "Inverter", color: "#8b5cf6" },
+                          { cat: "Structure", color: "#f59e0b" }, { cat: "Electrical", color: "#10b981" },
+                          { cat: "Service", color: "#ef4444" }, { cat: "Other", color: "#6b7280" },
+                        ].map(({ cat, color }) => {
+                          const catCost = bomData.components.filter(c => c.category === cat || (cat === "Other" && ["Metering", "Logistics", "Other"].includes(c.category))).reduce((s, c) => s + c.cost, 0);
+                          const pct = (catCost / bomData.totalBOMCost) * 100;
+                          return pct > 0 ? <div key={cat} title={`${cat}: ${fmt(catCost)} (${pct.toFixed(1)}%)`} style={{ width: `${pct}%`, background: color, minWidth: 2 }} /> : null;
+                        })}
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 6 }}>
+                        {[
+                          { cat: "Module", color: "#3b82f6" }, { cat: "Inverter", color: "#8b5cf6" },
+                          { cat: "Structure", color: "#f59e0b" }, { cat: "Electrical", color: "#10b981" },
+                          { cat: "Service", color: "#ef4444" },
+                        ].map(({ cat, color }) => (
+                          <span key={cat} style={{ fontSize: 11, color: colors.textMid, display: "flex", alignItems: "center", gap: 4 }}>
+                            <span style={{ width: 8, height: 8, borderRadius: 2, background: color, display: "inline-block" }} />{cat}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Summary Rows */}
+                    <div style={{ borderTop: `1px solid ${colors.border}`, paddingTop: 12 }}>
+                      {[
+                        ["BOM Cost", fmt(bomData.totalBOMCost)],
+                        [`Margin (${(bomData.marginPercent * 100).toFixed(0)}%)`, fmt(bomData.margin)],
+                        ["Subtotal", fmt(bomData.subtotal)],
+                        ["Payment Adj.", bomData.paymentAdjustment ? `-${fmt(Math.abs(bomData.paymentAdjustment))}` : "—"],
+                      ].map(([label, val]) => (
+                        <div key={label} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", fontSize: 13 }}>
+                          <span style={{ color: colors.textMid }}>{label}</span>
+                          <span style={{ fontWeight: 600 }}>{val}</span>
+                        </div>
+                      ))}
+                      <div style={{ display: "flex", justifyContent: "space-between", padding: "10px 0 0", borderTop: `2px solid ${colors.text}`, marginTop: 6, fontSize: 15 }}>
+                        <span style={{ fontWeight: 700 }}>Final Price</span>
+                        <span style={{ fontWeight: 800, color: colors.primary }}>{fmt(bomData.finalPrice)}</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {page === "detail" && selectedQuotation && bomData && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>{selectedQuotation.leadName}</h2>
+                  <Badge status={selectedQuotation.status} />
+                </div>
+                <div style={{ fontSize: 14, color: colors.textLight, marginTop: 4 }}>
+                  {selectedQuotation.id} · {selectedQuotation.location} · {selectedQuotation.moduleMake} · {selectedQuotation.inverterMake}
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button onClick={() => handleEdit(selectedQuotation)} style={{ ...baseBtn, background: colors.divider, color: colors.textMid }}>Edit</button>
+                <button onClick={() => setPage("bom")} style={{ ...baseBtn, background: colors.primaryLight, color: colors.primary }}>View BOM</button>
+                {selectedQuotation.status === "Pending" && <>
+                  <button onClick={() => handleReject(selectedQuotation.id)} style={{ ...baseBtn, background: colors.dangerLight, color: colors.danger }}>Reject</button>
+                  <button onClick={() => handleApprove(selectedQuotation.id)} style={{ ...baseBtn, background: colors.success, color: "#fff" }}>Approve</button>
+                </>}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginBottom: 24 }}>
+              <StatCard label="Actual Capacity" value={`${fmtDec(bomData.actualCapacity)} kW`} sub={`${bomData.numModules} modules × ${bomData.moduleWp}W`} />
+              <StatCard label="Final Price" value={fmt(bomData.finalPrice)} sub={`${fmt(bomData.pricePerKw)} per kW`} color={colors.primary} />
+              <StatCard label="Margin" value={`${(bomData.marginPercent * 100).toFixed(0)}%`} sub={fmt(bomData.margin)} color={colors.success} />
+              <StatCard label="BOM Cost" value={fmt(bomData.totalBOMCost)} />
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+              <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: 24 }}>
+                <SectionHeader title="Project Details" />
+                {[
+                  ["Installation", selectedQuotation.installationType],
+                  ["Floors", selectedQuotation.numberOfFloors],
+                  ["MMS Class", selectedQuotation.mmsClass],
+                  ["MMS Height", selectedQuotation.mmsHeight],
+                  ["Discom", selectedQuotation.discom],
+                  ["Service Lift", selectedQuotation.serviceLift ? "Yes" : "No"],
+                  ["Payment Mode", selectedQuotation.paymentMode],
+                ].map(([k, v]) => (
+                  <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${colors.divider}`, fontSize: 14 }}>
+                    <span style={{ color: colors.textMid }}>{k}</span>
+                    <span style={{ fontWeight: 600 }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: 24 }}>
+                <SectionHeader title="Cost Summary" />
+                {[
+                  { cat: "Module", color: "#3b82f6" }, { cat: "Inverter", color: "#8b5cf6" },
+                  { cat: "Structure", color: "#f59e0b" }, { cat: "Electrical", color: "#10b981" },
+                  { cat: "Metering", color: "#06b6d4" }, { cat: "Service", color: "#ef4444" },
+                  { cat: "Logistics", color: "#6b7280" }, { cat: "Other", color: "#a855f7" },
+                ].map(({ cat, color }) => {
+                  const total = bomData.components.filter(c => c.category === cat).reduce((s, c) => s + c.cost, 0);
+                  if (!total) return null;
+                  const pct = (total / bomData.totalBOMCost * 100).toFixed(1);
+                  return (
+                    <div key={cat} style={{ marginBottom: 10 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, marginBottom: 3 }}>
+                        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ width: 10, height: 10, borderRadius: 3, background: color, display: "inline-block" }} />
+                          {cat}
+                        </span>
+                        <span style={{ fontWeight: 600 }}>{fmt(total)} <span style={{ color: colors.textLight, fontWeight: 400 }}>({pct}%)</span></span>
+                      </div>
+                      <div style={{ height: 6, background: colors.divider, borderRadius: 3 }}>
+                        <div style={{ height: 6, background: color, borderRadius: 3, width: `${pct}%`, transition: "width 0.3s" }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {page === "bom" && selectedQuotation && bomData && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 24 }}>
+              <div>
+                <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>BOM Breakup</h2>
+                <div style={{ fontSize: 14, color: colors.textLight, marginTop: 4 }}>{selectedQuotation.id} · {selectedQuotation.leadName} · {fmtDec(bomData.actualCapacity)} kW</div>
+              </div>
+              <button onClick={() => setPage("detail")} style={{ ...baseBtn, background: colors.divider, color: colors.textMid }}>← Back to Pricing</button>
+            </div>
+            <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, overflow: "hidden" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+                <thead>
+                  <tr style={{ background: colors.divider }}>
+                    {["#", "Component", "Category", "Qty", "Unit", "Rate", "Total Cost"].map(h => (
+                      <th key={h} style={{ textAlign: h === "Rate" || h === "Total Cost" ? "right" : "left", padding: "12px 16px", fontWeight: 600, fontSize: 12, color: colors.textMid }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {bomData.components.map((c, i) => (
+                    <tr key={i} style={{ borderBottom: `1px solid ${colors.divider}` }}>
+                      <td style={{ padding: "12px 16px", color: colors.textLight }}>{i + 1}</td>
+                      <td style={{ padding: "12px 16px", fontWeight: 600 }}>{c.name}</td>
+                      <td style={{ padding: "12px 16px", color: colors.textMid }}>{c.category}</td>
+                      <td style={{ padding: "12px 16px" }}>{fmtDec(c.qty)}</td>
+                      <td style={{ padding: "12px 16px", color: colors.textMid }}>{c.unit}</td>
+                      <td style={{ padding: "12px 16px", textAlign: "right" }}>{fmt(c.rate)}</td>
+                      <td style={{ padding: "12px 16px", textAlign: "right", fontWeight: 600 }}>{fmt(c.cost)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr style={{ background: colors.divider }}>
+                    <td colSpan={6} style={{ padding: "12px 16px", fontWeight: 700, textAlign: "right" }}>Total BOM Cost</td>
+                    <td style={{ padding: "12px 16px", fontWeight: 800, textAlign: "right", fontSize: 16 }}>{fmt(bomData.totalBOMCost)}</td>
+                  </tr>
+                  <tr>
+                    <td colSpan={6} style={{ padding: "10px 16px", textAlign: "right", color: colors.textMid }}>Margin ({(bomData.marginPercent * 100).toFixed(0)}%)</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", fontWeight: 600, color: colors.success }}>+{fmt(bomData.margin)}</td>
+                  </tr>
+                  {bomData.paymentAdjustment !== 0 && <tr>
+                    <td colSpan={6} style={{ padding: "10px 16px", textAlign: "right", color: colors.textMid }}>Payment Adjustment</td>
+                    <td style={{ padding: "10px 16px", textAlign: "right", fontWeight: 600, color: bomData.paymentAdjustment > 0 ? colors.danger : colors.success }}>{bomData.paymentAdjustment > 0 ? "+" : "-"}{fmt(Math.abs(bomData.paymentAdjustment))}</td>
+                  </tr>}
+                  <tr style={{ background: colors.primaryLight }}>
+                    <td colSpan={6} style={{ padding: "14px 16px", fontWeight: 800, textAlign: "right", color: colors.primary }}>Final Price</td>
+                    <td style={{ padding: "14px 16px", fontWeight: 800, textAlign: "right", fontSize: 18, color: colors.primary }}>{fmt(bomData.finalPrice)}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {page === "approvals" && (
+          <div>
+            <h2 style={{ margin: "0 0 24px", fontSize: 22, fontWeight: 700 }}>Pending Approvals</h2>
+            {quotations.filter(q => q.status === "Pending").length === 0 ? (
+              <div style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: "60px 24px", textAlign: "center" }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+                <div style={{ fontSize: 16, fontWeight: 600, color: colors.text }}>All caught up</div>
+                <div style={{ fontSize: 14, color: colors.textLight, marginTop: 4 }}>No pending approvals right now</div>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {quotations.filter(q => q.status === "Pending").map(q => {
+                  const b = calculateBOM(q);
+                  return (
+                    <div key={q.id} style={{ background: colors.card, borderRadius: 12, border: `1px solid ${colors.border}`, padding: "20px 24px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <div>
+                          <div style={{ fontWeight: 700, fontSize: 16 }}>{q.leadName}</div>
+                          <div style={{ fontSize: 13, color: colors.textLight, marginTop: 2 }}>
+                            {q.id} · {fmtDec(b.actualCapacity)} kW · {q.moduleMake} · {q.inverterMake} · {q.location}
+                          </div>
+                        </div>
+                        <div style={{ textAlign: "right", marginRight: 16 }}>
+                          <div style={{ fontSize: 20, fontWeight: 700 }}>{fmt(b.finalPrice)}</div>
+                          <div style={{ fontSize: 12, color: colors.textLight }}>Margin: {(b.marginPercent * 100).toFixed(0)}%</div>
+                        </div>
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button onClick={() => { setSelectedId(q.id); setPage("detail"); }} style={{ ...baseBtn, background: colors.divider, color: colors.textMid, padding: "8px 14px", fontSize: 13 }}>View</button>
+                          <button onClick={() => handleReject(q.id)} style={{ ...baseBtn, background: colors.dangerLight, color: colors.danger, padding: "8px 14px", fontSize: 13 }}>Reject</button>
+                          <button onClick={() => handleApprove(q.id)} style={{ ...baseBtn, background: colors.success, color: "#fff", padding: "8px 14px", fontSize: 13 }}>Approve</button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
